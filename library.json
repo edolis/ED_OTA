@@ -1,0 +1,12 @@
+{
+ "name": "ED_",
+  "version": "1.0.0",
+  "description": "",
+  "keywords": [ "ESP32"],
+  "frameworks": ["espidf"],
+  "platforms": ["espressif32"],
+  "build": {
+    "srcFilter": "+<*>"
+  }
+}
+
