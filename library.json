@@ -1,7 +1,7 @@
 {
- "name": "ED_",
+ "name": "ED_OTA",
   "version": "1.0.0",
-  "description": "",
+  "description": "OTA functionalities for ESP ED system",
   "keywords": [ "ESP32"],
   "frameworks": ["espidf"],
   "platforms": ["espressif32"],
