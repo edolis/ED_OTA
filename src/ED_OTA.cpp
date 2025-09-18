@@ -7,11 +7,13 @@
 #include <esp_ota_ops.h>
 #include <regex.h>
 #include <string>
+#include "esp_crt_bundle.h"
 
 namespace ED_OTA {
 static const char *TAG = "ED_OTA";
-extern const uint8_t ca_crt_start[] asm("_binary_ca_crt_start");
-extern const uint8_t ca_crt_end[] asm("_binary_ca_crt_end");
+// *** notice! replaced by bundle to avoid using RAM
+// extern const uint8_t ca_crt_start[] asm("_binary_ca_crt_start");
+// extern const uint8_t ca_crt_end[] asm("_binary_ca_crt_end");
 
 bool scanFirmware(FirmwareScanner &scanner, const std::string &url) {
   int bytes_read;
@@ -20,8 +22,10 @@ bool scanFirmware(FirmwareScanner &scanner, const std::string &url) {
   esp_http_client_config_t config = {
       .url = url.c_str(),
       // .disable_auto_redirect = false,
-      .cert_pem = (const char *)ca_crt_start,
+      // .cert_pem = (const char *)ca_crt_start,
       .transport_type = HTTP_TRANSPORT_OVER_SSL,
+      .crt_bundle_attach = esp_crt_bundle_attach,
+
   };
   esp_http_client_handle_t client = esp_http_client_init(&config);
   // ESP_LOGI(TAG, "Step_1");
@@ -186,7 +190,8 @@ const char *FirmwareScanner::targetFwFile() {
 //#region OTAmanager
 
 
-OTAmanager::OTAmanager() {
+OTAmanager::OTAmanager( )
+   {
   ED_MQTT_dispatcher::ctrlCommand cmd(
       "FWUP", "Update firmware via OTA",
       ED_MQTT_dispatcher::ctrlCommand::cmdScope::GLOBAL,
@@ -271,8 +276,9 @@ void OTAmanager::ota_update_task(void *pvParameter) {
 
   config = {
       .url = fullUrl.c_str(),
-      .cert_pem = (const char *)ca_crt_start,
+      // .cert_pem = (const char *)ca_crt_start,
       .transport_type = HTTP_TRANSPORT_OVER_SSL,
+      .crt_bundle_attach = esp_crt_bundle_attach,
   };
 
   client = esp_http_client_init(&config);
@@ -443,10 +449,11 @@ void OTAmanager::cmd_getFwStatus(ED_MQTT_dispatcher::ctrlCommand *cmd) {
   const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
     // ESP_LOGI(TAG, "Step_in check ota state");
+    std::string response="";
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
       switch (ota_state) {
       case ESP_OTA_IMG_PENDING_VERIFY:
-        ESP_LOGI(TAG, "OTA: Image is PENDING_VERIFY");
+        response="OTA: Image is PENDING_VERIFY";
         // Run your self-tests here, then either:
         // On success:
         esp_ota_mark_app_valid_cancel_rollback();
@@ -454,19 +461,31 @@ void OTAmanager::cmd_getFwStatus(ED_MQTT_dispatcher::ctrlCommand *cmd) {
         // esp_ota_mark_app_invalid_rollback_and_reboot();
         break;
       case ESP_OTA_IMG_VALID:
-        ESP_LOGI(TAG, "OTA: Image is VALID");
+        response="OTA: Image is VALID";
         break;
       case ESP_OTA_IMG_INVALID:
-        ESP_LOGW(TAG, "OTA: Image is INVALID");
+        response="OTA: Image is INVALID";
         break;
       default:
-        ESP_LOGI(TAG, "OTA: Image state = %d", ota_state);
+        response= "OTA: Image state = " +  ota_state;
         break;
       }
     } else {
       ESP_LOGE(TAG, "Failed to get OTA state");
+
+
+
+
+      ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(std::stoll(cmd->optParam["_msgID"]),cmd->cmdID,
+      ED_MQTT_dispatcher::MQTTdispatcher::ackType::FAIL,"");
     }
-};
+    ESP_LOGI(TAG,"Step msgid_%s",cmd->optParam["_msgID"].c_str());
+    ESP_LOGI(TAG,"Step cmdid_%s",cmd->cmdID.c_str());
+    ESP_LOGI(TAG,"** %s",response.c_str());
+   ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(std::stoll(cmd->optParam["_msgID"]),cmd->cmdID,
+   ED_MQTT_dispatcher::MQTTdispatcher::ackType::OK,response);
+ESP_LOGI(TAG,"Step_endgetfwstatus");
+  }
 
 void OTAmanager::cmd_launchUpdate(const char *versionTarget) {
   // ESP_LOGI(TAG, "Step_in launchupdate");
