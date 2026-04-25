@@ -1,19 +1,32 @@
 #include "ED_OTA.h"
+#include "ED_sys.h"
 #include "ED_sysInfo.h"
-#include "ED_sysstd.h"
+#include "esp_crt_bundle.h"
 #include <driver/gpio.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
 #include <esp_ota_ops.h>
+#include <freertos/semphr.h>
 #include <regex.h>
 #include <string>
-#include "esp_crt_bundle.h"
 
 namespace ED_OTA {
+static SemaphoreHandle_t ota_mutex = NULL;
 static const char *TAG = "ED_OTA";
 // *** notice! replaced by bundle to avoid using RAM
 // extern const uint8_t ca_crt_start[] asm("_binary_ca_crt_start");
 // extern const uint8_t ca_crt_end[] asm("_binary_ca_crt_end");
+
+static std::string regex_escape(const std::string &s) {
+  static const char *meta = ".^$*+?()[{\\|";
+  std::string escaped;
+  for (char c : s) {
+    if (strchr(meta, c))
+      escaped.push_back('\\');
+    escaped.push_back(c);
+  }
+  return escaped;
+}
 
 bool scanFirmware(FirmwareScanner &scanner, const std::string &url) {
   int bytes_read;
@@ -37,7 +50,8 @@ bool scanFirmware(FirmwareScanner &scanner, const std::string &url) {
              esp_err_to_name(err));
     return false;
   }
-  esp_http_client_fetch_headers(client); //required for proper fucntioning of read
+  esp_http_client_fetch_headers(
+      client); // required for proper functioning of read
   // ESP_LOGI(TAG, "Step_3");
   // ESP_LOGI(TAG, "Content length: %d", content_length);
   do {
@@ -60,10 +74,13 @@ bool scanFirmware(FirmwareScanner &scanner, const std::string &url) {
 FirmwareScanner::FirmwareScanner(const char *curFwarePrj, const char *refFwVer,
                                  UpdateType mode)
     : prjID(curFwarePrj), buffer(""), carryover(""), best_filename(""),
-      matchingVersionFound(false) {
+      best_version{}, indexLock{}, matchingVersionFound(false) {
   // ESP_LOGI(TAG, "Step_in FirmwareScanner");
 
-  for (size_t i = 0; i < 4; i++)indexLock[i] = false;
+  for (size_t i = 0; i < 4; i++)
+    indexLock[i] = false;
+  for (int i = 0; i < 4; i++)
+    field_present[i] = false;
 
   regex_t regex;
   regmatch_t matches[5];
@@ -81,10 +98,13 @@ FirmwareScanner::FirmwareScanner(const char *curFwarePrj, const char *refFwVer,
           strncpy(temp, refFwVer + start, vlen);
           temp[vlen] = '\0';
           best_version[i] = atoi(temp);
+          field_present[i] = true; // <-- ADD THIS LINE
           if (mode == UpdateType::UPDATE_TO_SPECIFIC)
             indexLock[i] = true;
         } else {
           best_version[i] = -1;
+          field_present[i] =
+              false; // optional, already false from initialization
         }
       }
     }
@@ -96,6 +116,10 @@ bool FirmwareScanner::is_version_higher(int new_v[4], int best_v[4]) {
 
   for (int i = 0; i < 4; i++) {
     if (!indexLock[i]) {
+      // If best version missing this component, newer wins only if new_v[i] >
+      // 0? But we can skip comparison when field_present[i] == false.
+      if (!field_present[i])
+        continue; // don't compare missing field
       if (new_v[i] > best_v[i])
         return true;
       if (new_v[i] < best_v[i])
@@ -121,10 +145,11 @@ void FirmwareScanner::file_scanner_parse_chunk(const char *chunk,
   regex_t regex;
   regmatch_t matches[6];
   char pattern[128];
+  std::string escaped_prj = regex_escape(prjID);
   snprintf(pattern, sizeof(pattern),
            "href=\\\"(%s_v([[:digit:]]+)\\.([[:digit:]]+)\\.([[:digit:]]+)[^"
            "\\\"]*\\.bin(\\.lz4)?)\\\"",
-           prjID);
+           escaped_prj.c_str());
 
   if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
     ESP_LOGE(TAG, "could not compile regex pattern for firmware dat");
@@ -140,22 +165,28 @@ void FirmwareScanner::file_scanner_parse_chunk(const char *chunk,
     filename[len] = '\0';
     // ESP_LOGI(TAG, "Step_ filename %s", filename);
 
-    // Extract version components
-    int version[4];
-    for (int i = 0; i < 4; i++) {
+    // FIX Bug 4: filename pattern only captures 3 version groups (major, minor,
+    // patch) — build number is not present in filenames. Loop was previously
+    // running to i < 4, causing matches[5] to be read uninitialized when i==3.
+    // version[3] is zero-initialised and left as 0 (neutral for comparisons).
+    int version[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 3; i++) {
       int start = matches[i + 2].rm_so;
       int end = matches[i + 2].rm_eo;
+      if (start == -1)
+        break; // safety guard for unset capture group
       char temp[16];
       int vlen = end - start;
       strncpy(temp, ptr + start, vlen);
       temp[vlen] = '\0';
       version[i] = atoi(temp);
     }
+
     ESP_LOGI(TAG, "Evaluating candidate: %s → %d.%d.%d-%d", filename,
              version[0], version[1], version[2], version[3]);
 
     if (is_version_higher(version, best_version)) {
-      strncpy(best_filename, filename, MAX_FILENAME_LEN);
+      snprintf(best_filename, MAX_FILENAME_LEN, "%s", filename);
       memcpy(best_version, version, sizeof(version));
       matchingVersionFound = true;
     }
@@ -182,16 +213,14 @@ const char *FirmwareScanner::targetFwFile() {
     return nullptr;
 };
 
-
-
 // #endregion FirmwareScanner
 
+// #region OTAmanager
 
-//#region OTAmanager
-
-
-OTAmanager::OTAmanager( )
-   {
+OTAmanager::OTAmanager() {
+  if (ota_mutex == NULL) {
+    ota_mutex = xSemaphoreCreateMutex();
+  }
   ED_MQTT_dispatcher::ctrlCommand cmd(
       "FWUP", "Update firmware via OTA",
       ED_MQTT_dispatcher::ctrlCommand::cmdScope::GLOBAL,
@@ -201,6 +230,7 @@ OTAmanager::OTAmanager( )
     this->cmd_launchUpdate(cmd);
   };
   registerCommand(cmd);
+
   ED_MQTT_dispatcher::ctrlCommand cmd1(
       "FWCO", "Confirms OTA partition as valid",
       ED_MQTT_dispatcher::ctrlCommand::cmdScope::GLOBAL, {});
@@ -219,6 +249,13 @@ OTAmanager::OTAmanager( )
 };
 
 void OTAmanager::ota_update_task(void *pvParameter) {
+  if (ota_mutex == NULL || xSemaphoreTake(ota_mutex, portMAX_DELAY) != pdTRUE) {
+    ESP_LOGE(TAG, "Failed to take OTA mutex");
+    if (pvParameter)
+      free(pvParameter);
+    vTaskDelete(NULL);
+    return;
+  }
   // --- All variables declared at top ---
   const char *verRef = static_cast<const char *>(pvParameter);
   uint8_t *c_buffer = (uint8_t *)malloc(BUFFER_SIZE);
@@ -237,6 +274,7 @@ void OTAmanager::ota_update_task(void *pvParameter) {
   const esp_partition_t *update_partition = nullptr;
   FirmwareScanner *fwScanner = nullptr;
 
+
   // --- Dynamic dictionary allocation (16 KB) ---
   // needs to be in synch with the compressor utility in python
   const int LZ4_DICT_SIZE = 16 * 1024;
@@ -249,9 +287,9 @@ void OTAmanager::ota_update_task(void *pvParameter) {
     goto exit;
   }
 
-  version = (verRef == nullptr) ? ED_sysstd::ESP_std::fwVer() : verRef;
+  version = (verRef == nullptr) ? ED_SYS::ESP_std::Firmware::version() : verRef;
 
-  fwScanner = new FirmwareScanner(ED_sysstd::ESP_std::fwPrjName(), version,
+  fwScanner = new FirmwareScanner(ED_SYS::ESP_std::Firmware::prjName(), version,
                                   (verRef == nullptr)
                                       ? FirmwareScanner::UPDATE_TO_LATEST
                                       : FirmwareScanner::UPDATE_TO_SPECIFIC);
@@ -260,9 +298,16 @@ void OTAmanager::ota_update_task(void *pvParameter) {
   httpPath = fwStorageUrl;
   if (!scanFirmware(*fwScanner, fwStorageUrl)) {
     ESP_LOGW(TAG, "Primary scan failed, trying fallback...");
+    delete fwScanner;   // discard the polluted scanner
+    fwScanner = new FirmwareScanner(ED_SYS::ESP_std::Firmware::prjName(), version,
+                                    (verRef == nullptr) ? FirmwareScanner::UPDATE_TO_LATEST
+                                                        : FirmwareScanner::UPDATE_TO_SPECIFIC);
     httpPath = fwObsUrl;
-    scanFirmware(*fwScanner, fwObsUrl);
-  }
+    if (!scanFirmware(*fwScanner, fwObsUrl)) {
+        ESP_LOGE(TAG, "Fallback scan also failed");
+        goto exit;
+    }
+}
 
   if (fwScanner->targetFwFile() == nullptr) {
     ESP_LOGI(TAG, "No target firmware found");
@@ -272,7 +317,8 @@ void OTAmanager::ota_update_task(void *pvParameter) {
   fullUrl = httpPath + std::string(fwScanner->targetFwFile());
   ESP_LOGI(TAG, "OTA: launching update with file <%s>",
            fwScanner->targetFwFile());
-  // ESP_LOGI(TAG, "httpPath is %s, setting url: %s", httpPath, fullUrl.c_str());
+  // ESP_LOGI(TAG, "httpPath is %s, setting url: %s", httpPath,
+  // fullUrl.c_str());
 
   config = {
       .url = fullUrl.c_str(),
@@ -289,6 +335,8 @@ void OTAmanager::ota_update_task(void *pvParameter) {
   }
 
   esp_http_client_fetch_headers(client);
+  int content_length = esp_http_client_get_content_length(client);
+
   status = esp_http_client_get_status_code(client);
   ESP_LOGI(TAG, "HTTP status code: %d", status);
   if (status != 200) {
@@ -311,6 +359,7 @@ void OTAmanager::ota_update_task(void *pvParameter) {
   }
 
   ESP_LOGI(TAG, "Starting OTA read loop...");
+  size_t total_written = 0;
 
   while (true) {
     uint32_t block_size = 0;
@@ -356,6 +405,8 @@ void OTAmanager::ota_update_task(void *pvParameter) {
       goto exit;
     }
 
+    total_written += decompressed_bytes;
+
     ota_data_written = true;
 
     // Update rolling dictionary (max LZ4_DICT_SIZE)
@@ -373,6 +424,13 @@ void OTAmanager::ota_update_task(void *pvParameter) {
 
   if (!ota_data_written) {
     ESP_LOGE(TAG, "No OTA data was written — aborting");
+    ota_data_written = false;
+    goto exit;
+  }
+
+  if (content_length > 0 && total_written != (size_t)content_length) {
+    ESP_LOGE(TAG, "OTA size mismatch: expected %d, got %zu", content_length,
+             total_written);
     goto exit;
   }
 
@@ -381,8 +439,8 @@ void OTAmanager::ota_update_task(void *pvParameter) {
     goto exit;
   }
 
-  ESP_LOGI(TAG,
-           "OTA update successful. Switching new partition as boot default and rebooting...");
+  ESP_LOGI(TAG, "OTA update successful. Switching new partition as boot "
+                "default and rebooting...");
 
   err = esp_ota_set_boot_partition(update_partition);
   if (err != ESP_OK) {
@@ -393,7 +451,11 @@ void OTAmanager::ota_update_task(void *pvParameter) {
   esp_restart();
 
 exit:
-  if(client)
+  // FIX Bug 3: removed duplicate unconditional esp_http_client_cleanup(client)
+  // that was present after this guarded call, causing a double-free.
+  if (ota_mutex)
+    xSemaphoreGive(ota_mutex);
+  if (client)
     esp_http_client_cleanup(client);
   if (fwScanner)
     delete fwScanner;
@@ -407,7 +469,6 @@ exit:
     LZ4_freeStreamDecode(lz4_stream);
   if (pvParameter != nullptr)
     free((void *)pvParameter);
-  esp_http_client_cleanup(client);
   vTaskDelete(NULL);
 }
 
@@ -417,21 +478,21 @@ void OTAmanager::cmd_otaValidate(ED_MQTT_dispatcher::ctrlCommand *cmd) {
 
 void OTAmanager::cmd_otaValidate(bool otaIsValid) {
 
-  /* The validation is performed automathically by ESP after
+  /* The validation is performed automatically by ESP after
 CONFIG_BOOTLOADER_WDT_TIME_MS=9000
 so this call will not be required.
-to control the transition from PENDING to VALID state manually, need to modify the sdkconfig setting
-CONFIG_BOOTLOADER_WDT_TIME_MS=-1
-
+To control the transition from PENDING to VALID state manually, modify the
+sdkconfig setting: CONFIG_BOOTLOADER_WDT_TIME_MS=-1
   */
   const esp_partition_t *running = esp_ota_get_running_partition();
   esp_ota_img_states_t ota_state;
-  ESP_LOGI(TAG, "pre-OTA validation state: %s",
-           (ota_state == ESP_OTA_IMG_PENDING_VERIFY) ? "PENDING_VERIFY"
-                                                     : "VALID");
+
+  // FIX Bug 1: ota_state was logged before being populated by
+  // esp_ota_get_state_partition(), producing undefined behaviour. The log now
+  // sits inside the if-branch where ota_state is known to be valid.
   if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
       ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-
+    ESP_LOGI(TAG, "pre-OTA validation state: PENDING_VERIFY");
     if (otaIsValid) {
       esp_ota_mark_app_valid_cancel_rollback();
       ESP_LOGI(TAG, "Firmware verified, rollback canceled");
@@ -439,71 +500,84 @@ CONFIG_BOOTLOADER_WDT_TIME_MS=-1
       ESP_LOGE(TAG, "Diagnostics failed, rolling back");
       esp_ota_mark_app_invalid_rollback_and_reboot();
     }
+  } else {
+    ESP_LOGI(TAG, "pre-OTA validation state: VALID (or not an OTA partition)");
   }
 };
 
 void OTAmanager::cmd_launchUpdate(ED_MQTT_dispatcher::ctrlCommand *cmd) {
   cmd_launchUpdate(cmd->optParam["default"].c_str());
 }
+
 void OTAmanager::cmd_getFwStatus(ED_MQTT_dispatcher::ctrlCommand *cmd) {
   const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_img_states_t ota_state;
-    // ESP_LOGI(TAG, "Step_in check ota state");
-    std::string response="";
-    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-      switch (ota_state) {
-      case ESP_OTA_IMG_PENDING_VERIFY:
-        response="OTA: Image is PENDING_VERIFY";
-        // Run your self-tests here, then either:
-        // On success:
-        esp_ota_mark_app_valid_cancel_rollback();
-        // On failure:
-        // esp_ota_mark_app_invalid_rollback_and_reboot();
-        break;
-      case ESP_OTA_IMG_VALID:
-        response="OTA: Image is VALID";
-        break;
-      case ESP_OTA_IMG_INVALID:
-        response="OTA: Image is INVALID";
-        break;
-      default:
-        response= "OTA: Image state = " +  ota_state;
-        break;
-      }
-    } else {
-      ESP_LOGE(TAG, "Failed to get OTA state");
-
-
-
-
-      ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(std::stoll(cmd->optParam["_msgID"]),cmd->cmdID,
-      ED_MQTT_dispatcher::MQTTdispatcher::ackType::FAIL,"");
+  esp_ota_img_states_t ota_state;
+  // ESP_LOGI(TAG, "Step_in check ota state");
+  std::string response = "";
+  if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+    switch (ota_state) {
+    case ESP_OTA_IMG_PENDING_VERIFY:
+      response = "OTA: Image is PENDING_VERIFY";
+      // Run your self-tests here, then either:
+      // On success:
+      // esp_ota_mark_app_valid_cancel_rollback();  //DEBUG
+      // On failure:
+      // esp_ota_mark_app_invalid_rollback_and_reboot();
+      break;
+    case ESP_OTA_IMG_VALID:
+      response = "OTA: Image is VALID";
+      break;
+    case ESP_OTA_IMG_INVALID:
+      response = "OTA: Image is INVALID";
+      break;
+    default:
+      // FIX Bug 2: was `response = "OTA: Image state = " + ota_state` which
+      // performs integer offset arithmetic on the string literal pointer
+      // (undefined behaviour), not string concatenation.
+      response =
+          "OTA: Image state = " + std::to_string(static_cast<int>(ota_state));
+      break;
     }
-    ESP_LOGI(TAG,"Step msgid_%s",cmd->optParam["_msgID"].c_str());
-    ESP_LOGI(TAG,"Step cmdid_%s",cmd->cmdID.c_str());
-    ESP_LOGI(TAG,"** %s",response.c_str());
-   ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(std::stoll(cmd->optParam["_msgID"]),cmd->cmdID,
-   ED_MQTT_dispatcher::MQTTdispatcher::ackType::OK,response);
-ESP_LOGI(TAG,"Step_endgetfwstatus");
+  } else {
+    ESP_LOGE(TAG, "Failed to get OTA state");
+    ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(
+        std::stoll(cmd->optParam["_msgID"]), cmd->cmdID,
+        ED_MQTT_dispatcher::MQTTdispatcher::ackType::FAIL, "");
   }
+  ESP_LOGI(TAG, "Step msgid_%s", cmd->optParam["_msgID"].c_str());
+  ESP_LOGI(TAG, "Step cmdid_%s", cmd->cmdID.c_str());
+  ESP_LOGI(TAG, "** %s", response.c_str());
+  ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(
+      std::stoll(cmd->optParam["_msgID"]), cmd->cmdID,
+      ED_MQTT_dispatcher::MQTTdispatcher::ackType::OK, response);
+  ESP_LOGI(TAG, "Step_endgetfwstatus");
+}
 
 void OTAmanager::cmd_launchUpdate(const char *versionTarget) {
   // ESP_LOGI(TAG, "Step_in launchupdate");
 
   char *ver_copy = nullptr;
   if (versionTarget != nullptr && strlen(versionTarget) > 0)
-    ver_copy = strdup(versionTarget); // this must be coming from MQTT command,
-                                      // copy required to avoid out of scope
+    ver_copy =
+        strdup(versionTarget); // coming from MQTT command,
+                               // copy required to avoid out-of-scope access
+if (ver_copy == NULL) {
+    ESP_LOGE(TAG, "strdup failed");
+    return;
+}
   // ESP_LOGI(TAG, "Step_in launchupdate creating task");
 
-  xTaskCreate(&ED_OTA::OTAmanager::ota_update_task, "ota_task", 8192,
+  // Stack increased from 8192 to 16384: HTTPS TLS handshake + LZ4
+  // decompression + std::string operations require headroom beyond 8 KB.
+  xTaskCreate(&ED_OTA::OTAmanager::ota_update_task, "ota_task", 16384,
               (void *)ver_copy, 5, NULL);
 }
+
 /*
-to be defined. how hook the right led GPIO?
+to be defined: how to hook the right led GPIO?
 */
 
-//#endregion OTAmanager
+// #endregion OTAmanager
 
 // void indicate_ota_success(gpio_num_t OTA_LED) {
 //   gpio_set_direction(OTA_LED, GPIO_MODE_OUTPUT);

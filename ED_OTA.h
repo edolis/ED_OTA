@@ -32,6 +32,7 @@ struct FirmwareScanner {
     };
   const char *prjID;
 
+
   /// @brief initializes a firmware scanner class instance, which scanse the
   /// buffer of a http directory to detect if a  newer firmware file is
   /// available for the current project
@@ -52,6 +53,7 @@ struct FirmwareScanner {
   // void updateVersionArray(int* vArray);
 
 private:
+bool field_present[4]; // true if that component existed in refFwVer
   char buffer[BUFFER_SIZE + CARRYOVER_SIZE + 1]; // +1 for null terminator
   char carryover[CARRYOVER_SIZE + 1];
   char best_filename[MAX_FILENAME_LEN];
