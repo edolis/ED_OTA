@@ -60,7 +60,14 @@ class OTAmanager : public ED_MQTT_dispatcher::CommandWithRegistry {
 private:
   static inline const char fwStorageUrl[30] = "https://raspi00/fware/";
   static inline const char fwObsUrl[30] = "https://raspi00/fware/obs/";
+
+  struct OtaTaskParams {
+    const char *versionTarget;   // may be nullptr (owned by this struct, freed by task)
+    int64_t     msgID;           // original MQTT message ID for ack
+  };
+
   static void ota_update_task(void *pvParameter);
+  static void sendOtaAck(int64_t msgID, const char *selectedFile);
 
 public:
   void cmd_otaValidate(ED_MQTT_dispatcher::ctrlCommand *cmd);

@@ -1,15 +1,15 @@
 /**
- * @file main_OTA_test.cpp
- * @brief OTA update test using ED_OTA library with MQTT commands.
+* @file main.cpp
+* @brief OTA test using ED_OTA library with MQTT commands, PFREQ, and firmware info on boot.
  *
  * @author Emanuele Dolis (emanuele.dolis@gmail.com)
- * @version GIT_VERSION: v0.0.3-0-gbb20eb4-dirty
+ * @version GIT_VERSION: v1.1.4-0-g3cc2340-dirty
  * @date 2026-05-09
  * @submodules-start
- *   ED_MQTT   : v1.2.0-0-gd7baea1
- *   ED_OTA    : v1.0.0-0-g7c85c31-dirty
+ *   ED_MQTT   : v1.2.0-0-gd7baea1-dirty
+ *   ED_OTA    : v2.0.0-0-gdc4778e-dirty
  *   ED_S_JSON : v1.1.0-0-g62ddf73
- *   ED_WIFI   : v1.0.0-0-g2f08383
+ *   ED_WIFI   : v1.0.0-0-g2f08383-dirty
  * @submodules-end
  */
 
@@ -21,6 +21,7 @@
 #include "mqtt_client.h"
 #include <cstdio>
 #include <cstring>
+#include <math.h>
 
 #include "ED_MQTT_dispatcher.h"
 #include "ED_OTA.h"
@@ -30,15 +31,14 @@
 
 static const char *TAG = "MAIN_OTA_TEST";
 
-// ESP32‑S3 Zero built‑in WS2812 LED on GPIO21
 #define PIN_NEOPIXEL 21
 #define NUM_LEDS 1
-#define BRIGHTNESS 50
+#define BRIGHTNESS 30
 
 static led_strip_handle_t led_strip = nullptr;
 
 // ---------------------------------------------------------------------
-// LED strip configuration (no designated initializers)
+// LED helpers
 // ---------------------------------------------------------------------
 static void configure_led(void) {
   led_strip_config_t strip_config = {};
@@ -61,95 +61,164 @@ static void configure_led(void) {
 }
 
 static void set_led(uint8_t red, uint8_t green, uint8_t blue) {
-  if (!led_strip)
-    return;
+  if (!led_strip) return;
   led_strip_set_pixel(led_strip, 0, red, green, blue);
   led_strip_refresh(led_strip);
 }
 
 static void clear_led() {
-  if (!led_strip)
-    return;
+  if (!led_strip) return;
   led_strip_clear(led_strip);
 }
 
+// ---------------------------------------------------------------------
+// Rainbow colour mapping (patch 0‑9)
+// ---------------------------------------------------------------------
+static void hue_to_rgb(float hue, uint8_t *r, uint8_t *g, uint8_t *b) {
+    hue = fmodf(hue, 360.0f);
+    float s = 1.0f, v = 1.0f;
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(hue / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float rp, gp, bp;
+
+    if (hue < 60)       { rp = c; gp = x; bp = 0; }
+    else if (hue < 120) { rp = x; gp = c; bp = 0; }
+    else if (hue < 180) { rp = 0; gp = c; bp = x; }
+    else if (hue < 240) { rp = 0; gp = x; bp = c; }
+    else if (hue < 300) { rp = x; gp = 0; bp = c; }
+    else                { rp = c; gp = 0; bp = x; }
+
+    *r = (uint8_t)((rp + m) * 255);
+    *g = (uint8_t)((gp + m) * 255);
+    *b = (uint8_t)((bp + m) * 255);
+}
+
 static void led_blink_task(void *arg) {
-  // Use the new Firmware API to get version components
-  const char *version = ED_SYS::ESP_std::Firmware::version();
-  int patch = ED_SYS::ESP_std::Firmware::patchVersion();
+    const char *version = ED_SYS::ESP_std::Firmware::version();
+    int patch = ED_SYS::ESP_std::Firmware::patchVersion();
 
-  uint8_t red = 0, green = 0, blue = 0;
-  if (patch == 1)
-    red = BRIGHTNESS;
-  else if (patch == 2)
-    blue = BRIGHTNESS;
-  else if (patch == 3)
-    green = BRIGHTNESS;
-  else {
-    red = green = blue = BRIGHTNESS;
-  }
+    float hue = (patch % 10) * 36.0f;
+    uint8_t r, g, b;
+    hue_to_rgb(hue, &r, &g, &b);
 
-  ESP_LOGI(TAG, "Version %s (patch %d) -> R=%d G=%d B=%d", version, patch, red,
-           green, blue);
-  configure_led();
+    ESP_LOGI(TAG, "Version %s (patch %d, hue %.0f°) -> R=%d G=%d B=%d",
+             version, patch, hue, r, g, b);
+    configure_led();
 
-  const uint32_t blink_ms = 1000;
-  while (1) {
-    set_led(red, green, blue);
-    vTaskDelay(pdMS_TO_TICKS(blink_ms));
-    clear_led();
-    vTaskDelay(pdMS_TO_TICKS(blink_ms));
-  }
+    const uint32_t blink_ms = 1000;
+    while (1) {
+        set_led(r, g, b);
+        vTaskDelay(pdMS_TO_TICKS(blink_ms));
+        clear_led();
+        vTaskDelay(pdMS_TO_TICKS(blink_ms));
+    }
 }
 
 // ---------------------------------------------------------------------
-// Main entry point
+// Publish firmware details on boot
+// ---------------------------------------------------------------------
+static void publish_firmware_info(void *arg) {
+    // Wait until the MQTT client handle is valid
+    esp_mqtt_client_handle_t cl = nullptr;
+    while ((cl = ED_MQTT_dispatcher::MQTTdispatcher::getClientHandle()) == nullptr) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    ED_MQTT::MqttClient *client = ED_MQTT::MqttClient::getInstance();
+    if (!client) {
+        ESP_LOGE(TAG, "No MQTT client instance");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const char *deviceID = ED_SYS::ESP_std::Device::mqttName();
+    const char *version  = ED_SYS::ESP_std::Firmware::version();
+
+    // Simple message
+    char simpleMsg[128];
+    snprintf(simpleMsg, sizeof(simpleMsg), "%s running %s", deviceID, version);
+    client->publish("info/firmware/simple", simpleMsg, 0, false);
+
+    // Full JSON with all version details
+    char jsonBuf[512];
+    snprintf(jsonBuf, sizeof(jsonBuf),
+        "{"
+        "\"device\":\"%s\","
+        "\"project\":\"%s\","
+        "\"version\":\"%s\","
+        "\"tag\":\"%s\","
+        "\"major\":%d,"
+        "\"minor\":%d,"
+        "\"patch\":%d,"
+        "\"build\":%d,"
+        "\"hash_short\":\"%s\","
+        "\"hash_full\":\"%s\","
+        "\"build_id\":\"%s\","
+        "\"dirty\":%s"
+        "}",
+        deviceID,
+        ED_SYS::ESP_std::Firmware::prjName(),
+        version,
+        ED_SYS::ESP_std::Firmware::tag(),
+        ED_SYS::ESP_std::Firmware::majorVersion(),
+        ED_SYS::ESP_std::Firmware::minorVersion(),
+        ED_SYS::ESP_std::Firmware::patchVersion(),
+        ED_SYS::ESP_std::Firmware::buildNumber(),
+        ED_SYS::ESP_std::Firmware::shortHash(),
+        ED_SYS::ESP_std::Firmware::fullHash(),
+        ED_SYS::ESP_std::Firmware::buildId(),
+        ED_SYS::ESP_std::Firmware::isDirty() ? "true" : "false"
+    );
+    client->publish("info/firmware", jsonBuf, 0, false);
+
+    ESP_LOGI(TAG, "Published firmware info");
+    vTaskDelete(NULL);
+}
+// ---------------------------------------------------------------------
+// Main
 // ---------------------------------------------------------------------
 extern "C" void app_main() {
-  // ---- Debug: print firmware version details from the new API ----
-  ESP_LOGI(TAG, "Firmware version details:");
-  ESP_LOGI(TAG, "  Full version: %s", ED_SYS::ESP_std::Firmware::version());
-  ESP_LOGI(TAG, "  Tag:          %s", ED_SYS::ESP_std::Firmware::tag());
-  ESP_LOGI(TAG, "  Major:        %d", ED_SYS::ESP_std::Firmware::majorVersion());
-  ESP_LOGI(TAG, "  Minor:        %d", ED_SYS::ESP_std::Firmware::minorVersion());
-  ESP_LOGI(TAG, "  Patch:        %d", ED_SYS::ESP_std::Firmware::patchVersion());
-  ESP_LOGI(TAG, "  Build number: %d", ED_SYS::ESP_std::Firmware::buildNumber());
-  ESP_LOGI(TAG, "  Short hash:   %s", ED_SYS::ESP_std::Firmware::shortHash());
-  ESP_LOGI(TAG, "  Full hash:    %s", ED_SYS::ESP_std::Firmware::fullHash());
-  ESP_LOGI(TAG, "  Build ID:     %s", ED_SYS::ESP_std::Firmware::buildId());
-  ESP_LOGI(TAG, "  Dirty:        %s", ED_SYS::ESP_std::Firmware::isDirty() ? "yes" : "no");
+    ESP_LOGI(TAG, "Firmware version details:");
+    ESP_LOGI(TAG, "  Full version: %s", ED_SYS::ESP_std::Firmware::version());
+    ESP_LOGI(TAG, "  Tag:          %s", ED_SYS::ESP_std::Firmware::tag());
+    ESP_LOGI(TAG, "  Major:        %d", ED_SYS::ESP_std::Firmware::majorVersion());
+    ESP_LOGI(TAG, "  Minor:        %d", ED_SYS::ESP_std::Firmware::minorVersion());
+    ESP_LOGI(TAG, "  Patch:        %d", ED_SYS::ESP_std::Firmware::patchVersion());
+    ESP_LOGI(TAG, "  Build number: %d", ED_SYS::ESP_std::Firmware::buildNumber());
+    ESP_LOGI(TAG, "  Short hash:   %s", ED_SYS::ESP_std::Firmware::shortHash());
+    ESP_LOGI(TAG, "  Full hash:    %s", ED_SYS::ESP_std::Firmware::fullHash());
+    ESP_LOGI(TAG, "  Build ID:     %s", ED_SYS::ESP_std::Firmware::buildId());
+    ESP_LOGI(TAG, "  Dirty:        %s", ED_SYS::ESP_std::Firmware::isDirty() ? "yes" : "no");
 
-  // Start LED blink task
-  xTaskCreate(led_blink_task, "led_blink", 4096, NULL, 1, NULL);
+    xTaskCreate(led_blink_task, "led_blink", 4096, NULL, 1, NULL);
 
-  // Start WiFi
-  ED_wifi::WiFiService::launch();
+    ED_wifi::WiFiService::launch();
 
-  // ---- MQTT dispatcher configuration (required for OTA commands) ----
-  esp_mqtt_client_config_t mqtt_cfg = {};
-  mqtt_cfg.broker.address.uri = "mqtts://raspi00:8883";
-  mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
-  mqtt_cfg.credentials.username = ED_MQTT_USERNAME;
-  mqtt_cfg.credentials.client_id = ED_SYS::ESP_std::Device::mqttName();
-  mqtt_cfg.credentials.authentication.password = ED_MQTT_PASSWORD;
-  mqtt_cfg.session.last_will.topic = "test";
-  mqtt_cfg.session.last_will.msg = "last will message";
-  mqtt_cfg.session.last_will.qos = 1;
-  mqtt_cfg.session.last_will.retain = true;
-  mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri = "mqtts://raspi00:8883";
+    mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+    mqtt_cfg.credentials.username = ED_MQTT_USERNAME;
+    mqtt_cfg.credentials.client_id = ED_SYS::ESP_std::Device::mqttName();
+    mqtt_cfg.credentials.authentication.password = ED_MQTT_PASSWORD;
+    mqtt_cfg.session.last_will.topic = "test";
+    mqtt_cfg.session.last_will.msg = "last will message";
+    mqtt_cfg.session.last_will.qos = 1;
+    mqtt_cfg.session.last_will.retain = true;
+    mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
 
-  // Initialize and run the dispatcher (starts MQTT when IP is ready)
-  ED_MQTT_dispatcher::MQTTdispatcher::initialize(&mqtt_cfg);
-  ED_MQTT_dispatcher::MQTTdispatcher::run();
+    ED_MQTT_dispatcher::MQTTdispatcher::initialize(&mqtt_cfg);
+    ED_MQTT_dispatcher::MQTTdispatcher::run();
 
-  // ---- OTA manager ----
-  static ED_OTA::OTAmanager otaManager;
-  // Subscribe OTA manager to the dispatcher (receives colon commands)
-  ED_MQTT_dispatcher::MQTTdispatcher::subscribe(&otaManager);
+    static ED_OTA::OTAmanager otaManager;
+    ED_MQTT_dispatcher::MQTTdispatcher::subscribe(&otaManager);
 
-  ESP_LOGI(TAG, "System ready. MQTT dispatcher running. OTA manager active.");
+    // Publish firmware info once MQTT is ready
+    xTaskCreate(publish_firmware_info, "fw_info_pub", 4096, NULL, 1, NULL);
 
-  while (1) {
-    vTaskDelay(pdMS_TO_TICKS(10000));
-  }
+    ESP_LOGI(TAG, "System ready. MQTT dispatcher running. OTA manager active.");
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 }

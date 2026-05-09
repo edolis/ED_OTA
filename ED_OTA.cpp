@@ -4,6 +4,8 @@
 #include "esp_crt_bundle.h"
 #include <cctype>
 #include <cstring>
+#include <cstdlib>   // strtoll
+#include <cerrno>    // errno
 #include <driver/gpio.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
@@ -111,10 +113,6 @@ FirmwareScanner::FirmwareScanner(const char *curFwarePrj, const char *refFwVer,
             best_version[i] = -1;
         }
     }
-
-    ESP_LOGI(TAG, "Scanner baseline: v%d.%d.%d-%d, locks: [%d][%d][%d][%d]",
-             best_version[0], best_version[1], best_version[2], best_version[3],
-             prefix_locked[0], prefix_locked[1], prefix_locked[2], prefix_locked[3]);
 
     char pattern[256];
     std::string escaped_prj = regex_escape(prjID);
@@ -237,11 +235,12 @@ OTAmanager::OTAmanager() {
 }
 
 void OTAmanager::ota_update_task(void *pvParameter) {
-    ESP_LOGI(TAG, "OTA task started");
+    OtaTaskParams *params = static_cast<OtaTaskParams *>(pvParameter);
+    const char *verRef = params->versionTarget;
+    int64_t msgID = params->msgID;
+    delete params;   // params itself is freed, verRef ownership transferred
 
-    const char *verRef = static_cast<const char *>(pvParameter);
-    uint8_t *c_buffer = nullptr;   // compressed block input
-    uint8_t *d_buffer = nullptr;   // decompressed block output
+    uint8_t *c_buffer = nullptr, *d_buffer = nullptr;
     esp_http_client_handle_t client = nullptr;
     esp_ota_handle_t ota_handle = 0;
     LZ4_streamDecode_t *lz4_stream = nullptr;
@@ -252,7 +251,6 @@ void OTAmanager::ota_update_task(void *pvParameter) {
     esp_err_t err = ESP_OK;
     bool decomp_error = false;
 
-    // Rolling dictionary (16 KB) – must match the compressor
     const int LZ4_DICT_SIZE = 16 * 1024;
     uint8_t *dict_buffer = (uint8_t *)heap_caps_malloc(LZ4_DICT_SIZE, MALLOC_CAP_8BIT);
     int dict_size = 0;
@@ -265,8 +263,9 @@ void OTAmanager::ota_update_task(void *pvParameter) {
             break;
         }
 
-        const char *version = (verRef != nullptr) ? verRef
-                                : ED_SYS::ESP_std::Firmware::version();
+        const char *version = (verRef != nullptr)
+                                  ? verRef
+                                  : ED_SYS::ESP_std::Firmware::version();
         fwScanner = new FirmwareScanner(
             ED_SYS::ESP_std::Firmware::prjName(), version,
             (verRef == nullptr) ? FirmwareScanner::UPDATE_TO_LATEST
@@ -285,6 +284,9 @@ void OTAmanager::ota_update_task(void *pvParameter) {
             break;
         }
         ESP_LOGI(TAG, "Selected: %s", fwScanner->targetFwFile());
+
+        // ── OTA ack (before download) ────────────────────────
+        sendOtaAck(msgID, fwScanner->targetFwFile());
 
         std::string fullUrl = httpPath + std::string(fwScanner->targetFwFile());
         ESP_LOGI(TAG, "Download URL: %s", fullUrl.c_str());
@@ -352,7 +354,6 @@ void OTAmanager::ota_update_task(void *pvParameter) {
                 break;
             }
 
-            // Attach rolling dictionary for this block
             LZ4_setStreamDecode(lz4_stream, (const char *)dict_buffer, dict_size);
 
             int decompressed = LZ4_decompress_safe_continue(
@@ -373,7 +374,6 @@ void OTAmanager::ota_update_task(void *pvParameter) {
             ota_data_written = true;
             chunks++;
 
-            // Update rolling dictionary (max LZ4_DICT_SIZE)
             if (dict_size + decompressed <= LZ4_DICT_SIZE) {
                 memcpy(dict_buffer + dict_size, d_buffer, decompressed);
                 dict_size += decompressed;
@@ -416,8 +416,30 @@ void OTAmanager::ota_update_task(void *pvParameter) {
     if (d_buffer) free(d_buffer);
     if (fwScanner) delete fwScanner;
     if (client) esp_http_client_cleanup(client);
-    if (pvParameter) free((void *)pvParameter);
+    // verRef allocated by strdup in cmd_launchUpdate, must be freed
+    if (verRef) free((void *)verRef);
     vTaskDelete(NULL);
+}
+void OTAmanager::sendOtaAck(int64_t msgID, const char *selectedFile) {
+    const char *deviceID      = ED_SYS::ESP_std::Device::mqttName();
+    const char *runningVer    = ED_SYS::ESP_std::Firmware::version();
+
+    char ackPayload[256];
+    if (msgID > 0) {
+        // Epoch provided by the server – include it for correlation
+        snprintf(ackPayload, sizeof(ackPayload),
+                 "%s running %s, starting OTA for %s (epoch=%lld)",
+                 deviceID, runningVer, selectedFile, (long long)msgID);
+    } else {
+        snprintf(ackPayload, sizeof(ackPayload),
+                 "%s running %s, starting OTA for %s",
+                 deviceID, runningVer, selectedFile);
+    }
+
+    ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(
+        msgID, "FWUP",
+        ED_MQTT_dispatcher::MQTTdispatcher::ackType::OK,
+        ackPayload);
 }
 
 void OTAmanager::cmd_otaValidate(ED_MQTT_dispatcher::ctrlCommand *cmd) {
@@ -450,18 +472,54 @@ void OTAmanager::cmd_launchUpdate(ED_MQTT_dispatcher::ctrlCommand *cmd) {
         ESP_LOGI(TAG, "Launching OTA update to latest");
         target = nullptr;
     }
-    cmd_launchUpdate(target);
-}
 
-void OTAmanager::cmd_launchUpdate(const char *versionTarget) {
+    // Extract msgID for ack
+    const char *msgid_str = cmd->getParam("_msgID");
+    int64_t msgID = 0;
+    if (msgid_str && msgid_str[0] != '\0') {
+        char *endptr = nullptr;
+        msgID = strtoll(msgid_str, &endptr, 10);
+        if (endptr == msgid_str || *endptr != '\0') msgID = 0;
+    }
+
     char *ver_copy = nullptr;
-    if (versionTarget && strlen(versionTarget) > 0)
-        ver_copy = strdup(versionTarget);
-    BaseType_t rc = xTaskCreate(&ED_OTA::OTAmanager::ota_update_task, "ota_task", 8192,
-                                (void *)ver_copy, 5, NULL);
+    if (target && strlen(target) > 0)
+        ver_copy = strdup(target);
+
+    OtaTaskParams *params = new OtaTaskParams;
+    params->versionTarget = ver_copy;
+    params->msgID = msgID;
+
+    BaseType_t rc = xTaskCreate(&ED_OTA::OTAmanager::ota_update_task,
+                                "ota_task", 8192,
+                                (void *)params, 5, NULL);
     if (rc != pdPASS) {
         ESP_LOGE(TAG, "Failed to create OTA task");
         free(ver_copy);
+        delete params;
+    } else {
+        ESP_LOGI(TAG, "OTA task created");
+    }
+}
+
+void OTAmanager::cmd_launchUpdate(const char *versionTarget) {
+    // This overload is retained for backwards compatibility.
+    // It does not carry an msgID, so no ack will be sent.
+    char *ver_copy = nullptr;
+    if (versionTarget && strlen(versionTarget) > 0)
+        ver_copy = strdup(versionTarget);
+
+    OtaTaskParams *params = new OtaTaskParams;
+    params->versionTarget = ver_copy;
+    params->msgID = 0;
+
+    BaseType_t rc = xTaskCreate(&ED_OTA::OTAmanager::ota_update_task,
+                                "ota_task", 8192,
+                                (void *)params, 5, NULL);
+    if (rc != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create OTA task");
+        free(ver_copy);
+        delete params;
     } else {
         ESP_LOGI(TAG, "OTA task created");
     }
@@ -482,12 +540,22 @@ void OTAmanager::cmd_getFwStatus(ED_MQTT_dispatcher::ctrlCommand *cmd) {
         ESP_LOGE(TAG, "Failed to get OTA state");
         return;
     }
+
     const char *msgid_str = cmd->getParam("_msgID");
-    if (msgid_str) {
-        ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(
-            std::stoll(msgid_str), cmd->cmdID,
-            ED_MQTT_dispatcher::MQTTdispatcher::ackType::OK,
-            response.c_str());
+    if (msgid_str && strlen(msgid_str) > 0) {
+        char *endptr = nullptr;
+        errno = 0;
+        long long msg_id = strtoll(msgid_str, &endptr, 10);
+        if (endptr != msgid_str && *endptr == '\0' && errno == 0) {
+            ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(
+                msg_id, cmd->cmdID,
+                ED_MQTT_dispatcher::MQTTdispatcher::ackType::OK,
+                response.c_str());
+        } else {
+            ESP_LOGE(TAG, "Invalid _msgID parameter: %s", msgid_str);
+        }
+    } else {
+        ESP_LOGI(TAG, "OTA status (no ack): %s", response.c_str());
     }
     ESP_LOGI(TAG, "OTA status: %s", response.c_str());
 }
