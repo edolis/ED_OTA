@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "ED_OTA.cpp"
-        "lz4.c"
+         "lz4/lz4.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_http_client

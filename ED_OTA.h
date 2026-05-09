@@ -12,20 +12,17 @@
 #pragma once
 
 #include "ED_MQTT_dispatcher.h"
-#include "lz4.h"
+#include "lz4/lz4.h"                // raw LZ4 API (streaming)
 #include <regex.h>
 
-
-#define COMPRESSED_BLOCK_SIZE 4096 // maximum compressed block size from HTTP
-#define DECOMPRESSED_BLOCK_SIZE                                                \
-  16384 // must be >= max decompressed output (16KB)
+#define COMPRESSED_BLOCK_SIZE   4096   // maximum compressed block from HTTP
+#define DECOMPRESSED_BLOCK_SIZE 16384  // must be >= max decompressed output (16KB)
 #define CARRYOVER_SIZE 128
 #define MAX_FILENAME_LEN 128
 
 namespace ED_OTA {
 
-/// @brief scans firmware files in an HTTP directory listing to find the best
-/// candidate.
+/// @brief scans firmware files in an HTTP directory listing to find the best candidate.
 struct FirmwareScanner {
   enum UpdateType { UPDATE_TO_LATEST, UPDATE_TO_SPECIFIC };
 
@@ -57,7 +54,7 @@ private:
 
 /**
  * @brief OTA updater controlled via MQTT commands.
- * Implements HTTPS + LZ4 streaming.
+ * Implements HTTPS + LZ4 streaming (raw block‑prefixed format).
  */
 class OTAmanager : public ED_MQTT_dispatcher::CommandWithRegistry {
 private:

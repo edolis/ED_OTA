@@ -1,395 +1,252 @@
-# OTA Firmware Update Workflow for ESP‑IDF Projects
+# ED_OTA Library: Over‑the‑Air Update Process & Test Guide
 
-> **Reference**
-> This documentation was developed through an extended conversation with DeepSeek.
-> You can view the full discussion here:
-> [https://chat.deepseek.com/a/chat/s/23d38e69-d7f2-4a4a-94f7-7fa3c7ca75cf](https://chat.deepseek.com/a/chat/s/23d38e69-d7f2-4a4a-94f7-7fa3c7ca75cf)
-
-This document describes the **fully automatic OTA (Over‑The‑Air) update system** implemented in the project. The system automatically:
-
-- Injects **git version information**, **build ID**, and **git hashes** into the firmware.
-- Detects whether the `ED_OTA` component is actually **linked** into the final binary (directly or indirectly) and **conditionally** compresses the binary with LZ4 and copies it to a shared folder.
-- Uses **CMake** and a **Python helper script** to keep the source code clean (placeholders are replaced at build time).
-- No manual `menuconfig` steps – detection is based on the actual build dependencies, making it fully automatic and version‑controlled.
-
-The **device‑side OTA logic** is triggered via **MQTT commands** (JSON format on the `cmd` topic). This document explains both the **build‑time pipeline** and the **run‑time OTA flow**.
+This document describes the OTA update system for the Pxxx project. It covers the test procedure using MQTT commands to switch between firmware versions (e.g., `v0.0.3` ↔ `v0.0.1`), the internal LZ4 decompression mechanism, and the server‑side file requirements. It also explains why incremental builds work correctly when changing Git tags, and the troubleshooting steps taken to ensure the LZ4 compression format matches the ESP32 decoder.
 
 ---
 
-## Table of Contents
+## 1. System Architecture
 
-1. [Architecture Overview](#architecture-overview)
-2. [Project Structure](#project-structure)
-3. [Build Workflow (Step‑by‑Step)](#build-workflow-step-by-step)
-4. [Version Injection into `main.cpp`](#version-injection-into-maincpp)
-5. [OTA Post‑Build Compression & Deployment](#ota-post-build-compression--deployment)
-6. [MQTT Commands & Triggering (Device Side)](#mqtt-commands--triggering-device-side)
-7. [Configuration & Customisation](#configuration--customisation)
-8. [Troubleshooting](#troubleshooting)
+The OTA subsystem consists of:
 
----
+- **OTA Server**: A network share (`//raspi00/fware/`) exposed via HTTPS, holding compressed firmware files (`.bin.lz4`).
+- **ED_OTA library** (`ED_OTA.h` / `ED_OTA.cpp`): Manages firmware scanning, selection, download, LZ4 decompression, and flashing.
+- **MQTT command interface**: Commands are sent to the `cmd` topic (e.g., `:FWUP v0.0.3`) to trigger updates.
+- **Version management**: Git tags drive the version string; the build system and Python scripts propagate it consistently into the binary and the OTA file name.
 
-## Architecture Overview
-
-The system is split into two parts:
-
-- **Build‑time (host)**:
-  - CMake extracts git metadata, generates `version.h`, and (if the `ED_OTA` component is part of the build) compresses the final `.bin` with LZ4 and copies it to a network share.
-  - A Python script runs before compilation to replace placeholder strings in `main.cpp` with the actual values from `version.h`. This keeps the source file readable (placeholders like `"v0.0.0-0-dirty"`) while ensuring the firmware contains the correct version.
-
-- **Run‑time (device)**:
-  - The `ED_OTA` component uses HTTPS + LZ4 streaming to download the compressed firmware from a web server.
-  - MQTT commands (`FWUP`, `FWCO`, `FWQS`) control the update process.
-
-The following diagram shows the **build‑time pipeline**:
-
-```mermaid
-flowchart TD
-    A[Start idf.py build] --> B[CMake runs]
-    B --> C[git describe and rev-parse]
-    C --> D{Has tag?}
-    D -->|Yes| E[Extract version tag count hash]
-    D -->|No| F[Fallback v0.0.0-0 short hash]
-    E --> G[Generate VERSION_STRING and BUILD_ID]
-    F --> G
-    G --> H[Component registration]
-    H --> I{Target __idf_ED_OTA exists?}
-    I -->|Yes| J[Set ENABLE_OTA=1]
-    I -->|No| K[Set ENABLE_OTA=0]
-    J --> L[Configure version.h from template]
-    K --> L
-    L --> M[Python script runs pre-build]
-    M --> N[Replace placeholders in main.cpp]
-    N --> O[Compile firmware]
-    O --> P{ENABLE_OTA eq 1?}
-    P -->|Yes| Q[lz4 compress final bin]
-    Q --> R[Copy to shared folder]
-    P -->|No| S[Build finished]
-    R --> S
-```
-
-The **device‑side OTA update flow** is:
+The following sequence diagram illustrates the complete OTA flow.
 
 ```mermaid
 sequenceDiagram
-    participant Client as mosquitto_pub
-    participant Broker as MQTT Broker
-    participant Device as ESP32
-    participant HTTPServer as HTTPS Server
-    participant Flash as SPI Flash
+    participant User
+    participant MQTTbroker
+    participant ESP32
+    participant OTAserver
 
-    Client->>Broker: PUBLISH cmd FWUP data latest
-    Broker->>Device: Forward command
-    Device->>Device: Parse start ota_task
-    Device->>HTTPServer: GET /fware/P029_v1.0.0-0.bin.lz4
-    HTTPServer-->>Device: LZ4 compressed stream
-    Device->>Device: Decompress in chunks LZ4
-    Device->>Flash: Write to OTA partition
-    Device->>Device: Validate and reboot
-    Note over Device: After reboot send FWCO to confirm
-    Client->>Broker: PUBLISH cmd FWCO
-    Broker->>Device: Forward command
-    Device->>Device: Mark OTA partition valid
+    User->>MQTTbroker: publish "cmd" topic<br/>":FWUP v0.0.1"
+    MQTTbroker->>ESP32: forward message
+    ESP32->>ESP32: Parse command, launch OTA task
+    ESP32->>OTAserver: HTTPS GET directory listing
+    OTAserver-->>ESP32: HTML with file links
+    ESP32->>ESP32: FirmwareScanner parses candidates,<br/>selects best match
+    ESP32->>OTAserver: HTTPS GET selected .bin.lz4
+    OTAserver-->>ESP32: compressed stream (raw blocks)
+    loop For each compressed block
+        ESP32->>ESP32: Read 4‑byte size header
+        ESP32->>ESP32: Read compressed data
+        ESP32->>ESP32: LZ4_decompress_safe_continue()<br/>(with rolling dictionary)
+        ESP32->>ESP32: esp_ota_write() to OTA partition
+    end
+    ESP32->>ESP32: esp_ota_end(), set boot partition
+    ESP32->>ESP32: esp_restart()
+    ESP32-->>ESP32: Reboot into new firmware
 ```
 
 ---
 
-## Project Structure
+## 2. Test Setup
 
-Key files and their roles:
+### 2.1 Hardware
+- **ESP32‑S3 Zero** (or any ESP32 with OTA partitions)
+- Built‑in WS2812 LED on GPIO21 – visual feedback: red (patch 1), blue (patch 2), green (patch 3), white (default).
 
-| File / Directory | Purpose |
-|------------------|---------|
-| `CMakeLists.txt` (root) | Detects project name from folder prefix (`P029_kiln` → `P029`). Runs the Python version‑injection script as a pre‑build step. Defines OTA post‑build compression (if `ENABLE_OTA=1`). |
-| `main/CMakeLists.txt` | Git version extraction (handles tagged and untagged commits). Generates `version.h` from `version.h.in`. Registers the component **without** `COMPILE_DEFINITIONS` (to avoid a CMake parsing bug). Uses `target_compile_definitions` after registration to set `ENABLE_OTA`. **Detects OTA usage by checking `if(TARGET __idf_ED_OTA)`** – this catches both direct and indirect dependencies. |
-| `main/version.h.in` | Template for `version.h`. Contains `@FW_...@` placeholders replaced by CMake. Uses `#cmakedefine ENABLE_OTA 1` to optionally define the macro. |
-| `tools/update_version_comment.py` | Python script that reads the generated `build/main/version.h` and replaces the placeholder strings in the `GIT_fwInfo` struct inside `main.cpp`. Runs before every build. |
-| `components/ED_OTA/` (submodule) | Contains `ED_OTA.h` and `ED_OTA.cpp` – the OTA update logic (HTTPS + LZ4 streaming, MQTT command handlers). |
-| `main/main.cpp` | Contains the `GIT_fwInfo` struct with **literal placeholder strings**. These are replaced by the Python script at build time. The struct is used by other modules to access version information. |
+### 2.2 Network
+- WiFi: `Edolis` (or your configured AP)
+- MQTT broker at `192.168.1.220` (plain MQTT on port 1883 for testing) or `raspi00` (TLS on 8883 for production). The test command below uses the unencrypted port.
+
+### 2.3 Firmware Files on the Server
+The shared folder `\\raspi00\fware\` contains compressed images in **raw LZ4 block‑prefixed format** (not standard LZ4 frame). Examples:
+
+```
+Pxxx_v0.0.1-4-gbb20eb4-dirty.bin.lz4
+Pxxx_v0.0.3-0-gbb20eb4-dirty.bin.lz4
+```
+
+These are produced by the post‑build script `compress_ota.py` using the `lz4.block` Python module with a rolling dictionary.
 
 ---
 
-## Build Workflow (Step‑by‑Step)
+## 3. Version Propagation – No Clean Build Required
 
-### 1. Project name detection (root CMakeLists.txt)
+Changing a Git tag and rebuilding **does not need a full clean** because:
 
-The folder name (e.g. `P029_kiln`) is read, and the part before the first underscore is extracted (`P029`). This becomes `PROJECT_NAME`. It is used for the output binary and the compressed file name.
+- **`PROJECT_VER`** is obtained at CMake configure time: `execute_process(git describe --tags --long --dirty --always)`. When the tag changes, CMake re‑evaluates the version, and the firmware’s `app_desc` is updated.
+- **Compile definitions** `FW_FULL_HASH` and `FW_BUILD_ID` change with the commit hash or timestamp, forcing recompilation of `ED_sys.cpp`.
+- **`main.cpp`** is modified by the pre‑build script `update_version_comment.py` using the exact version from CMake; the build system detects the file change and recompiles it.
 
-```cmake
-get_filename_component(CURRENT_FOLDER_NAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
-string(REGEX REPLACE "^([^_]+).*" "\\1" PROJECT_PREFIX "${CURRENT_FOLDER_NAME}")
-if(PROJECT_PREFIX MATCHES "^P[0-9][0-9][0-9]")
-    set(PROJECT_NAME "${PROJECT_PREFIX}")
-endif()
-```
-
-### 2. Git version extraction (main/CMakeLists.txt)
-
-- `git describe --tags --long --dirty --always` and `git rev-parse HEAD` are executed.
-- The output is parsed:
-  - If a tag like `v1.2.3-...` exists → `VERSION_STRING = "v1.2.3-4"` (or `-dirty`).
-  - If no tag (e.g., `138a497-dirty`) → fallback: `VERSION_STRING = "v0.0.0-0"` (or `-dirty`), and `GIT_SHORT_HASH` is set to `g138a497`.
-- `BUILD_ID` is generated: `P{timestamp}-{short_hash_without_g}` (e.g., `P20250430-143022-138a497`).
-
-The parsing logic in `main/CMakeLists.txt` is robust and handles both tagged and untagged commits:
-
-```cmake
-if(GIT_DESCRIBE MATCHES "^v([0-9.]+)-(.*)-(\\d+)-(g[0-9a-f]+)(-dirty)?$")
-    # tagged case
-    ...
-else()
-    # untagged fallback
-    set(VERSION_BASE "0.0.0")
-    set(COMMIT_COUNT "0")
-    set(GIT_TAG "untagged")
-    string(REGEX REPLACE "^([a-f0-9]+)(-dirty)?$" "\\1" GIT_SHORT_HASH "${GIT_DESCRIBE}")
-    ...
-endif()
-```
-
-### 3. OTA detection using CMake target existence
-
-After `idf_component_register`, the `ED_OTA` component (if it is part of the build – either directly required by `main` or indirectly through another component) creates a CMake target named `__idf_ED_OTA`. This is the **most reliable** way to know whether the OTA code will be linked into the final binary. It works for both direct and indirect dependencies, and does not require scanning source files.
-
-```cmake
-# After idf_component_register
-if(TARGET __idf_ED_OTA)
-    set(ENABLE_OTA 1)
-    message(STATUS "OTA component is linked → LZ4 compression will run after build")
-else()
-    set(ENABLE_OTA 0)
-    message(STATUS "OTA component not linked → skipping post‑build steps")
-endif()
-```
-
-### 4. Generate `version.h`
-
-`configure_file` processes `main/version.h.in`, replacing all `@VAR@` placeholders with the current values. The resulting `version.h` is placed in `build/main/version.h`. It defines macros like `FW_GIT_VERSION`, `FW_GIT_TAG`, `FW_GIT_HASH`, `FW_FULL_HASH`, `FW_BUILD_ID`, and optionally `ENABLE_OTA` (via `#cmakedefine`).
-
-### 5. Component registration
-
-To avoid a CMake parsing bug where `COMPILE_DEFINITIONS` is misinterpreted as a directory, the `idf_component_register` call does **not** include that keyword. Instead, `target_compile_definitions` is used **after** registration:
-
-```cmake
-idf_component_register(
-    SRCS "main.cpp" "$ENV{ESP_HEADERS}/x509_crt_bundle.S"
-    INCLUDE_DIRS "." ${CMAKE_CURRENT_BINARY_DIR}
-    REQUIRES ED_WIFI ED_MQTT diag ED_S_JSON
-)
-
-target_compile_definitions(${COMPONENT_TARGET} PRIVATE ENABLE_OTA=${ENABLE_OTA})
-```
-
-### 6. Python pre‑build script (root CMakeLists.txt)
-
-The script `tools/update_version_comment.py` is set to run **before every build** using a custom target. It reads the generated `version.h` and replaces the literal placeholder strings in `main.cpp` with the actual values. This ensures the firmware always contains up‑to‑date version information while keeping the source file clean.
-
-```cmake
-find_package(Python3 REQUIRED)
-add_custom_target(
-    inject_version_before_build
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/update_version_comment.py
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMENT "Injecting current git version into main.cpp"
-    VERBATIM
-)
-add_dependencies(${CMAKE_PROJECT_NAME}.elf inject_version_before_build)
-```
-
-### 7. OTA post‑build compression (root CMakeLists.txt)
-
-If `ENABLE_OTA` is set to `1` (meaning the `ED_OTA` component is linked), the final firmware binary is compressed with LZ4 and copied to the shared folder (`//raspi00/fware/`). The target `gen_project_binary` is used to ensure the binary exists before compression.
-
-```cmake
-if(ENABLE_OTA)
-    find_program(LZ4_EXECUTABLE lz4)
-    if(LZ4_EXECUTABLE)
-        set(FW_BIN "${CMAKE_BINARY_DIR}/${PROJECT_NAME}.bin")
-        set(COMPRESSED_FW "${CMAKE_BINARY_DIR}/${PROJECT_NAME}_${PROJECT_VER_CACHE}.bin.lz4")
-        set(SHARED_FOLDER "//raspi00/fware")
-        add_custom_command(
-            TARGET gen_project_binary
-            POST_BUILD
-            COMMAND ${LZ4_EXECUTABLE} -9 --no-frame-crc -f ${FW_BIN} ${COMPRESSED_FW}
-            COMMAND ${CMAKE_COMMAND} -E copy ${COMPRESSED_FW} ${SHARED_FOLDER}/
-            COMMENT "LZ4 compressing OTA firmware as ${PROJECT_NAME}_${PROJECT_VER_CACHE}.bin.lz4"
-            VERBATIM
-        )
-    else()
-        message(WARNING "lz4 not found – OTA compression skipped")
-    endif()
-endif()
-```
+Thus, after deleting a tag (e.g., removing `v0.0.3`, leaving only `v0.0.1`), a simple `idf.py build` suffices. The new firmware will reflect the correct version, and the OTA file will be named accordingly.
 
 ---
 
-## Version Injection into `main.cpp`
+## 4. Triggering an OTA Update
 
-The file `main.cpp` contains a struct `GIT_fwInfo` with **literal placeholder strings**:
+### 4.1 MQTT Command Format
+Publish to the topic `cmd`:
 
-```cpp
-namespace ED_SYSINFO {
-struct GIT_fwInfo {
-    static constexpr const char* GIT_VERSION = "v0.0.0-0-dirty";
-    static constexpr const char* GIT_TAG     = "untagged";
-    static constexpr const char* GIT_HASH    = "g0000000";
-    static constexpr const char* FULL_HASH   = "0000000000000000000000000000000000000000";
-    static constexpr const char* BUILD_ID    = "P00000000-000000-0000000";
-};
-}
+```
+:FWUP <version>
 ```
 
-These placeholders are replaced at **build time** by the Python script `tools/update_version_comment.py`. The script:
+- `:FWUP v0.0.3` – installs the latest firmware compatible with the given version prefix.
+- `:FWUP` (without version) – installs the newest available firmware that matches the device’s current project name and has a higher version.
 
-1. Locates the generated `build/main/version.h`.
-2. Reads the values of `FW_GIT_VERSION`, `FW_GIT_TAG`, etc.
-3. Opens `main/main.cpp` and replaces the quoted strings inside the struct with the actual values.
-4. Saves the file – the next compilation step uses the updated source.
+### 4.2 Test Command using `mosquitto_pub`
 
-This approach keeps the source tree clean (placeholders are visible for documentation) while ensuring the firmware always contains the correct, up‑to‑date version information.
+Use the following command to send an OTA update request (MQTT v3.1.1 over plain TCP):
 
----
-
-## OTA Post‑Build Compression & Deployment
-
-When the `ED_OTA` component is part of the build (detected via `if(TARGET __idf_ED_OTA)`), the build system automatically:
-
-1. **Compresses** the final `.bin` file with LZ4 (maximum compression, level 9, force overwrite).
-2. **Names** the compressed file as `{PROJECT_NAME}_{VERSION_STRING}.bin.lz4` (e.g., `P029_v0.0.0-0.bin.lz4`).
-3. **Copies** it to the shared folder `//raspi00/fware/` (adjustable).
-
-The shared folder must be served by an HTTPS server (e.g., nginx, Apache) so that devices can download the file. The device expects URLs like `https://raspi00/fware/P029_v0.0.0-0.bin.lz4`.
-
----
-
-## MQTT Commands & Triggering (Device Side)
-
-The device subscribes to the MQTT topic `cmd` (configurable in `ED_MQTT_dispatcher`). Commands are sent as **JSON** objects with fields `"cmd"` and `"data"`.
-
-### Available OTA Commands
-
-| Command | Description | Data field |
-|---------|-------------|-------------|
-| `FWUP` | Launch OTA update. | `"latest"` (or a specific version string like `"1.2.3-5"`) |
-| `FWCO` | Confirm the running image as valid (prevents rollback). | (empty) |
-| `FWQS` | Query OTA image status (PENDING_VERIFY, VALID, INVALID). | (empty) |
-
-### Using `mosquitto_pub`
-
-Update to the latest version:
 ```bash
-mosquitto_pub -h broker_ip -t "cmd" -m '{"cmd":"FWUP","data":"latest"}'
+mosquitto_pub -i "raspi_test_client" -h 192.168.1.220 -p 1883 \
+  -u "usr" -P "pwd" -t "cmd" -m ":FWUP v0.0.3" -V mqttv311
 ```
 
-Update to a specific version (e.g., `v1.2.3-5`):
+Explanation:
+- `-i`: client ID (any unique string)
+- `-h`: MQTT broker host
+- `-p`: broker port (1883 for non‑TLS)
+- `-u` / `-P`: username / password
+- `-t`: topic to publish to (`cmd`)
+- `-m`: message payload (`:FWUP v0.0.3`)
+- `-V mqttv311`: use MQTT protocol version 3.1.1
+
+This triggers the device to scan for firmware matching `v0.0.3` and install it.
+
+---
+
+## 5. OTA Update Process in Detail
+
+### 5.1 Command Reception
+The `ED_MQTT_dispatcher` receives the message on the `cmd` topic, parses the command `FWUP`, and calls `OTAmanager::cmd_launchUpdate`. If a version target is present, it is passed to the OTA task.
+
+### 5.2 Firmware Scanning
+`ED_OTA::FirmwareScanner` fetches the HTTPS directory listing from `https://raspi00/fware/`. A regular expression extracts candidate filenames of the form:
+
+```text
+Pxxx_v<major>.<minor>.<patch>-<build>-g<hash>[-dirty].bin.lz4
+```
+
+The scanner compares each candidate against:
+- The **current firmware version** (if no target specified) – it picks the highest version with a “compatible prefix”, meaning it locks the same major.minor.patch if they were locked from the reference.
+- A **specific target version** (e.g., `v0.0.1`) – it locks major, minor, and patch to that target and looks for the highest build number.
+
+The selected candidate’s filename is used to construct the full download URL.
+
+### 5.3 Download
+The file is downloaded over HTTPS. The HTTP client uses the ESP certificate bundle for TLS verification.
+
+### 5.4 LZ4 Decompression
+The downloaded file is **not** a standard LZ4 frame. It uses a **raw block‑prefixed format with a rolling dictionary**:
+
+```text
+[4 bytes LE compressed size] [compressed block]
+[4 bytes LE compressed size] [compressed block]
+...
+```
+
+- **Compressed block size**: up to 4096 bytes.
+- **Decompressed block size**: up to 16384 bytes.
+- **Rolling dictionary**: 16 KB maintained across blocks, exactly matching the compressor’s dictionary update.
+
+Decompression steps:
+1. `LZ4_createStreamDecode()` creates a stream.
+2. For each block:
+   - Read 4‑byte little‑endian size.
+   - Read compressed data.
+   - Call `LZ4_setStreamDecode()` with the current dictionary buffer (16 KB).
+   - Call `LZ4_decompress_safe_continue()` to decompress into a 16 KB output buffer.
+   - Write the decompressed data to the OTA partition with `esp_ota_write()`.
+   - Update the dictionary by appending the decompressed data, rolling to the last 16 KB.
+
+This raw streaming format was chosen for efficient streaming decompression without requiring the LZ4 frame header. The Python compression script `compress_ota.py` uses the `lz4.block` module with `dict=history` and `store_size=False` to produce exactly this format.
+
+### 5.5 Flashing and Reboot
+- After the file is fully decompressed and written, `esp_ota_end()` finalises the partition.
+- `esp_ota_set_boot_partition()` marks the new partition as the boot target.
+- `esp_restart()` triggers a software reset.
+- The bootloader loads the new image from the OTA partition. If the image is valid, the new firmware runs.
+
+---
+
+## 6. LZ4 Compression Setup – Troubleshooting Note
+
+During development, a mismatch between the compression script and the ESP32 decoder caused the error:
+
+```text
+E (31349) ED_OTA: Block too large: 407708164
+```
+
+The issue was traced to the use of the **standard `lz4` command‑line tool**, which produces a standard LZ4 frame (magic number `04 22 4D 18`). The ESP32 expected raw block‑prefixed data with a rolling dictionary.
+
+**Fix**: A Python script (`compress_ota.py`) was written using the `lz4.block.compress` API with:
+
+- `mode='high_compression'`
+- `store_size=False` (no internal block size)
+- `compression=9`
+- `dict=history` (16 KB rolling dictionary)
+
+This produces the raw stream exactly as required by the ESP32 decoder. The script also writes the 4‑byte little‑endian length before each compressed block.
+
+Therefore, all firmware files on the server **must be generated by this script**; standard `.lz4` files will fail.
+
+---
+
+## 7. Testing Version Switching
+
+### 7.1 Initial State
+The device is running firmware with version `v0.0.3-...` (green LED). The server contains both `v0.0.3` and `v0.0.1` files.
+
+### 7.2 Downgrade Test
+Publish the downgrade command:
+
 ```bash
-mosquitto_pub -h broker_ip -t "cmd" -m '{"cmd":"FWUP","data":"1.2.3-5"}'
+mosquitto_pub -i "raspi_test_client" -h 192.168.1.220 -p 1883 \
+  -u "usr" -P "pwd" -t "cmd" -m ":FWUP v0.0.1" -V mqttv311
 ```
 
-Confirm new firmware after reboot:
+- The scanner locks major=0, minor=0, patch=1 and selects the file `Pxxx_v0.0.1-4-gbb20eb4-dirty.bin.lz4`.
+- The device downloads and flashes the image.
+- After reboot, the boot log shows: `App version: v0.0.1-4-gbb20eb4-dirty`.
+- The LED turns red (patch = 1).
+
+### 7.3 Upgrade Test
+Publish:
+
 ```bash
-mosquitto_pub -h broker_ip -t "cmd" -m '{"cmd":"FWCO"}'
+mosquitto_pub -i "raspi_test_client" -h 192.168.1.220 -p 1883 \
+  -u "usr" -P "pwd" -t "cmd" -m ":FWUP v0.0.3" -V mqttv311
 ```
 
-Query OTA status:
-```bash
-mosquitto_pub -h broker_ip -t "cmd" -m '{"cmd":"FWQS"}'
-```
+- The device installs `v0.0.3` and returns to green.
 
-### Internal Flow (Device)
-
-- `OTAmanager` registers the three commands during its constructor.
-- When `FWUP` is received, `cmd_launchUpdate` creates a FreeRTOS task `ota_update_task`.
-- The task:
-  - Scans the primary HTTP directory (and a fallback) for files matching `{PROJECT_NAME}_v*.bin.lz4`.
-  - Downloads the file in chunks, decompresses via LZ4 streaming, and writes the OTA partition.
-  - On success, sets the new partition as bootable and reboots.
-- After reboot, the application (or a manual `FWCO` command) must call `cmd_otaValidate(true)` to mark the image as valid and cancel rollback.
+No interruption of normal operation occurs during the download; the update is applied in the background and takes effect on reboot.
 
 ---
 
-## Configuration & Customisation
+## 8. File Listing on the Server
 
-### Shared folder path (build host)
+The HTTPS server must return a directory listing containing anchor tags. A typical listing looks like:
 
-Edit the top‑level `CMakeLists.txt`:
-```cmake
-set(SHARED_FOLDER "//raspi00/fware")   # UNC path for Windows
+```html
+<html><body>
+<a href="Pxxx_v0.0.1-4-gbb20eb4-dirty.bin.lz4">Pxxx_v0.0.1-4-gbb20eb4-dirty.bin.lz4</a>
+<a href="Pxxx_v0.0.3-0-gbb20eb4-dirty.bin.lz4">Pxxx_v0.0.3-0-gbb20eb4-dirty.bin.lz4</a>
+</body></html>
 ```
 
-### HTTP server URL (device side)
+The scanner regex is:
 
-Modify `ED_OTA.cpp` (or move constants to a header):
-```cpp
-static inline const char fwStorageUrl[30] = "https://your-server/fware/";
-static inline const char fwObsUrl[30] = "https://your-server/fware/obs/";
+```regex
+href=\"(Pxxx_v([[:digit:]]+)\.([[:digit:]]+)\.([[:digit:]]+)-([[:digit:]]+)[^\"]*\.bin(\.[a-z0-9]+)?)\"
 ```
 
-### LZ4 compression level
-
-In the top‑level `CMakeLists.txt`, replace `-9` with another level (1‑9):
-```cmake
-COMMAND ${LZ4_EXECUTABLE} -5 --no-frame-crc -f ${FW_BIN} ${COMPRESSED_FW}
-```
-
-### Git tag format
-
-For the version parser to work correctly, tags should follow the pattern `vX.Y.Z-...` (e.g., `v1.0.0-0`). The fallback `v0.0.0-0` is used when no tag is present.
+It captures the full filename, major, minor, patch, and build numbers.
 
 ---
 
-## Troubleshooting
+## 9. Summary
 
-### `Include directory '.../COMPILE_DEFINITIONS' is not a directory`
+- OTA updates are triggered by MQTT commands on the `cmd` topic.
+- The device downloads compressed firmware files from an HTTPS server, decompresses them using a custom raw LZ4 streaming format with a rolling dictionary, and flashes the new partition.
+- Version management is fully automated from Git tags, requiring no manual version strings.
+- Incremental builds correctly update the version after tag changes without a full clean.
+- The LZ4 compression is handled by the `compress_ota.py` script; standard `lz4` tools must not be used to create the OTA files.
 
-- **Cause**: A known CMake parsing bug when `COMPILE_DEFINITIONS` is used inside `idf_component_register` with certain spacing or line endings.
-- **Fix**: Remove `COMPILE_DEFINITIONS` from the registration call and use `target_compile_definitions` **after** the registration, as shown in the corrected `main/CMakeLists.txt`.
-
-### `version.h` not found or empty macros
-
-- Run `idf.py reconfigure` to generate `version.h`.
-- Ensure `main/version.h.in` contains the required `FW_*` macros.
-- Check that the git parsing logic correctly extracts `GIT_SHORT_HASH`, `GIT_FULL_HASH`, etc.
-
-### Python script does not replace placeholders
-
-- Run the script manually to see errors:
-  ```bash
-  python tools/update_version_comment.py
-  ```
-- Ensure `main.cpp` contains the exact struct with placeholder strings as shown above.
-- Check that `build/main/version.h` exists and contains the `FW_*` macros.
-
-### LZ4 compression fails (`lz4: command not found`)
-
-- Install LZ4 on Windows: download `lz4.exe` from the official GitHub release and place it in a folder on your `PATH` (e.g., `C:\Tools\LZ4`).
-- Alternatively, use the ESP‑IDF MSYS2 environment and run `pacman -S mingw-w64-x86_64-lz4`.
-
-### Shared folder copy fails (Permission denied)
-
-- Ensure the build user has write access to the network share. On Windows, you may need to map the share as a network drive (e.g., `net use Z: \\raspi00\fware`).
-- Use a forward‑slash UNC path: `//raspi00/fware`.
-
-### Device cannot download the firmware
-
-- Verify that the HTTP server serves the `.lz4` file with MIME type `application/octet-stream`.
-- Check that the filename matches the pattern expected by the device (e.g., `P029_v1.0.0-0.bin.lz4`).
-- Confirm that the URL in `fwStorageUrl` is correct and reachable from the device.
-
----
-
-## Final Notes
-
-This system provides a **fully automatic, version‑controlled OTA pipeline**. No manual steps (like `menuconfig`) are required – the presence of the OTA component in the build graph decides the behaviour. The detection using `if(TARGET __idf_ED_OTA)` is robust for both direct and indirect dependencies.
-
-- The **CMake scripts** handle git version extraction, `version.h` generation, and conditional post‑build compression.
-- The **Python script** keeps the source code clean by replacing placeholders at build time.
-- The **device‑side OTA** is triggered via simple MQTT commands and uses efficient LZ4 streaming.
-
-For further customisation, refer to the inline comments in `CMakeLists.txt` files and the documentation inside `ED_OTA.h`.
-
----
-
-**Reference to development conversation:**
-[https://chat.deepseek.com/a/chat/s/23d38e69-d7f2-4a4a-94f7-7fa3c7ca75cf](https://chat.deepseek.com/a/chat/s/23d38e69-d7f2-4a4a-94f7-7fa3c7ca75cf)
-```
+Use the provided `mosquitto_pub` command to test version switching, and verify the behaviour via the LED colour and the serial boot log.
