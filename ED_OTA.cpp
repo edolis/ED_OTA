@@ -81,6 +81,8 @@ FirmwareScanner::FirmwareScanner(const char *curFwarePrj, const char *refFwVer,
     : prjID(curFwarePrj), buffer(""), carryover(""), best_filename(""),
       matchingVersionFound(false) {
 
+        best_version_str[0] = '\0';
+
     for (int i = 0; i < 4; i++) {
         best_version[i] = 0;
         prefix_locked[i] = false;
@@ -129,8 +131,7 @@ FirmwareScanner::~FirmwareScanner() {
     regfree(&regex);
 }
 
-void FirmwareScanner::file_scanner_parse_chunk(const char *chunk,
-                                               size_t chunk_len) {
+void FirmwareScanner::file_scanner_parse_chunk(const char *chunk, size_t chunk_len) {
     size_t carry_len = strlen(carryover);
     memcpy(buffer, carryover, carry_len);
     memcpy(buffer + carry_len, chunk, chunk_len);
@@ -164,6 +165,23 @@ void FirmwareScanner::file_scanner_parse_chunk(const char *chunk,
             strncpy(best_filename, filename, MAX_FILENAME_LEN);
             memcpy(best_version, version, sizeof(version));
             matchingVersionFound = true;
+
+            // Extract the full version string from the filename (e.g., "v1.2.3-5")
+            const char* ver_start = strchr(filename, '_');
+            if (ver_start) {
+                ver_start++; // skip the underscore
+                const char* ver_end = strstr(ver_start, ".bin");
+                if (!ver_end) ver_end = ver_start + strlen(ver_start);
+                size_t vlen = ver_end - ver_start;
+                if (vlen > 0 && vlen < MAX_FILENAME_LEN) {
+                    strncpy(best_version_str, ver_start, vlen);
+                    best_version_str[vlen] = '\0';
+                } else {
+                    best_version_str[0] = '\0';
+                }
+            } else {
+                best_version_str[0] = '\0';
+            }
         }
 
         ptr += matches[0].rm_eo;
@@ -209,7 +227,9 @@ static void trampoline_FWQS(ED_MQTT_dispatcher::ctrlCommand *cmd) {
     if (g_otaManager) g_otaManager->cmd_getFwStatus(cmd);
 }
 
-OTAmanager::OTAmanager() {
+OTAmanager::OTAmanager()
+    : CommandWithRegistry("OTA", "Over-the-Air update commands")
+{
     if (ota_mutex == NULL) {
         ota_mutex = xSemaphoreCreateMutex();
     }
@@ -283,7 +303,26 @@ void OTAmanager::ota_update_task(void *pvParameter) {
             ESP_LOGI(TAG, "No target firmware file");
             break;
         }
-        ESP_LOGI(TAG, "Selected: %s", fwScanner->targetFwFile());
+
+        // --- Check if candidate version equals currently running version ---
+        const char* currentVer = ED_SYS::ESP_std::Firmware::version();
+        const char* candidateVer = fwScanner->getBestVersionStr();
+        if (candidateVer && candidateVer[0] != '\0' && strcmp(currentVer, candidateVer) == 0) {
+            ESP_LOGI(TAG, "Already running version %s – no OTA needed", currentVer);
+            // Send ack indicating no update required
+            const char *deviceID = ED_SYS::ESP_std::Device::mqttName();
+            char ackPayload[256];
+            snprintf(ackPayload, sizeof(ackPayload),
+                     "%s already running version %s, no update required",
+                     deviceID, currentVer);
+            ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(
+                msgID, "FWUP",
+                ED_MQTT_dispatcher::MQTTdispatcher::ackType::OK,
+                ackPayload);
+            break;   // skip OTA
+        }
+
+        ESP_LOGI(TAG, "Selected: %s (version %s)", fwScanner->targetFwFile(), candidateVer);
 
         // ── OTA ack (before download) ────────────────────────
         sendOtaAck(msgID, fwScanner->targetFwFile());
@@ -416,10 +455,11 @@ void OTAmanager::ota_update_task(void *pvParameter) {
     if (d_buffer) free(d_buffer);
     if (fwScanner) delete fwScanner;
     if (client) esp_http_client_cleanup(client);
-    // verRef allocated by strdup in cmd_launchUpdate, must be freed
     if (verRef) free((void *)verRef);
     vTaskDelete(NULL);
 }
+
+
 void OTAmanager::sendOtaAck(int64_t msgID, const char *selectedFile) {
     const char *deviceID      = ED_SYS::ESP_std::Device::mqttName();
     const char *runningVer    = ED_SYS::ESP_std::Firmware::version();
@@ -526,9 +566,15 @@ void OTAmanager::cmd_launchUpdate(const char *versionTarget) {
 }
 
 void OTAmanager::cmd_getFwStatus(ED_MQTT_dispatcher::ctrlCommand *cmd) {
+    ESP_LOGI(TAG, "cmd_getFwStatus called");
+
+    const char *msgid_str = cmd->getParam("_msgID");
+    ESP_LOGI(TAG, "FWQS: _msgID = '%s'", msgid_str ? msgid_str : "NULL");
+
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t ota_state;
     std::string response = "";
+
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
         switch (ota_state) {
             case ESP_OTA_IMG_PENDING_VERIFY: response = "OTA: Image is PENDING_VERIFY"; break;
@@ -538,26 +584,28 @@ void OTAmanager::cmd_getFwStatus(ED_MQTT_dispatcher::ctrlCommand *cmd) {
         }
     } else {
         ESP_LOGE(TAG, "Failed to get OTA state");
-        return;
+        response = "OTA: Failed to read state";
     }
 
-    const char *msgid_str = cmd->getParam("_msgID");
+    ESP_LOGI(TAG, "FWQS response: %s", response.c_str());
+
     if (msgid_str && strlen(msgid_str) > 0) {
         char *endptr = nullptr;
         errno = 0;
         long long msg_id = strtoll(msgid_str, &endptr, 10);
         if (endptr != msgid_str && *endptr == '\0' && errno == 0) {
+            ESP_LOGI(TAG, "Calling ackCommand with msg_id=%lld", msg_id);
             ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(
                 msg_id, cmd->cmdID,
                 ED_MQTT_dispatcher::MQTTdispatcher::ackType::OK,
                 response.c_str());
+            ESP_LOGI(TAG, "ackCommand called");
         } else {
             ESP_LOGE(TAG, "Invalid _msgID parameter: %s", msgid_str);
         }
     } else {
-        ESP_LOGI(TAG, "OTA status (no ack): %s", response.c_str());
+        ESP_LOGI(TAG, "No _msgID, skipping ack");
     }
-    ESP_LOGI(TAG, "OTA status: %s", response.c_str());
 }
 
 } // namespace ED_OTA

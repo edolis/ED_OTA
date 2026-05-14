@@ -33,6 +33,9 @@ struct FirmwareScanner {
   void file_scanner_parse_chunk(const char *chunk, size_t chunk_len);
   const char *targetFwFile();
 
+  /// @return full version string of the best candidate (e.g., "v1.2.3-5")
+  const char *getBestVersionStr() const { return best_version_str; }
+
 private:
   const char *prjID;
   regex_t regex;
@@ -41,6 +44,7 @@ private:
   char buffer[COMPRESSED_BLOCK_SIZE + CARRYOVER_SIZE + 1];
   char carryover[CARRYOVER_SIZE + 1];
   char best_filename[MAX_FILENAME_LEN];
+  char best_version_str[MAX_FILENAME_LEN];   // stores full version like "v1.2.3-5"
   int best_version[4]; // major, minor, patch, build
   bool prefix_locked[4];
   bool matchingVersionFound;
