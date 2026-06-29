@@ -235,23 +235,30 @@ OTAmanager::OTAmanager()
     }
     g_otaManager = this;
 
-    ED_MQTT_dispatcher::ctrlCommand cmd(
-        "FWUP", "Update firmware via OTA",
-        ED_MQTT_dispatcher::ctrlCommand::cmdScope::GLOBAL, {{"default", ""}});
+    // ---- FWUP command ----
+    ED_MQTT_dispatcher::ctrlCommand cmd;
+    cmd.cmdID = "FWUP";
+    cmd.cmdDex = "Update firmware via OTA";
     cmd.funcPointer = trampoline_FWUP;
-    registerCommand(cmd);
+    cmd.paramCount = 0;
+    cmd.addParam("default", "");           // optional default parameter (version target)
+    registry.registerCommand(cmd);
 
-    ED_MQTT_dispatcher::ctrlCommand cmd1(
-        "FWCO", "Confirms OTA partition as valid",
-        ED_MQTT_dispatcher::ctrlCommand::cmdScope::GLOBAL, {});
+    // ---- FWCO command ----
+    ED_MQTT_dispatcher::ctrlCommand cmd1;
+    cmd1.cmdID = "FWCO";
+    cmd1.cmdDex = "Confirms OTA partition as valid";
     cmd1.funcPointer = trampoline_FWCO;
-    registerCommand(cmd1);
+    cmd1.paramCount = 0;
+    registry.registerCommand(cmd1);
 
-    ED_MQTT_dispatcher::ctrlCommand cmd2(
-        "FWQS", "Query Status of running OTA",
-        ED_MQTT_dispatcher::ctrlCommand::cmdScope::GLOBAL, {});
+    // ---- FWQS command ----
+    ED_MQTT_dispatcher::ctrlCommand cmd2;
+    cmd2.cmdID = "FWQS";
+    cmd2.cmdDex = "Query Status of running OTA";
     cmd2.funcPointer = trampoline_FWQS;
-    registerCommand(cmd2);
+    cmd2.paramCount = 0;
+    registry.registerCommand(cmd2);
 }
 
 void OTAmanager::ota_update_task(void *pvParameter) {

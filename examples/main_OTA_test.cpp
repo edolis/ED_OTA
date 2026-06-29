@@ -3,13 +3,14 @@
 * @brief OTA test using ED_OTA library with MQTT commands, PFREQ, and firmware info on boot.
  *
  * @author Emanuele Dolis (emanuele.dolis@gmail.com)
- * @version GIT_VERSION: v1.1.4-0-g3cc2340-dirty
- * @date 2026-05-09
+ * @version GIT_VERSION: v1.1.3-2-g1ca6c6c-dirty
+ * @date 2026-05-15
  * @submodules-start
- *   ED_MQTT   : v1.2.0-0-gd7baea1-dirty
- *   ED_OTA    : v2.0.0-0-gdc4778e-dirty
- *   ED_S_JSON : v1.1.0-0-g62ddf73
- *   ED_WIFI   : v1.0.0-0-g2f08383-dirty
+ *   ED_EEPROM : V1.0.0-0-g620932e-dirty
+ *   ED_MQTT   : v1.3.0-2-gabaad83
+ *   ED_OTA    : v2.0.0-2-gcd9ff99
+ *   ED_S_JSON : v1.2.0-0-g89a8ae5
+ *   ED_WIFI   : v1.0.0-1-g10b3d09
  * @submodules-end
  */
 
@@ -29,13 +30,36 @@
 #include "ED_wifi.h"
 #include "secrets.h"
 
+
+// ---------------------------------------------------------------------
+// loads default pin assignments for the specific board
+#define BOARD_VARIANT_ESP32S3_ZERO
+#include "ed_board.h"
+
 static const char *TAG = "MAIN_OTA_TEST";
 
-#define PIN_NEOPIXEL 21
 #define NUM_LEDS 1
 #define BRIGHTNESS 30
 
 static led_strip_handle_t led_strip = nullptr;
+
+
+// ---------------------------------------------------------------------
+//   AP info provider
+// ---------------------------------------------------------------------
+static void wifiDiagProvider(ED_S_JSON::StaticJson& diagObj) {
+    auto apInfo = ED_wifi::WiFiService::getCurrentAPInfo();
+    if (apInfo.has_value()) {
+        diagObj.addString("dDGT", "DTW");            // as requested
+        diagObj.addString("dS", "Y");            // as requested
+        diagObj.addString("d_ssid", apInfo->ssid);
+        diagObj.addInt("d_rssi", apInfo->rssi);
+    } else {
+        diagObj.addString("dS", "N");
+        diagObj.addString("d_ssid", "none");
+        diagObj.addInt("d_rssi", 0);
+    }
+}
 
 // ---------------------------------------------------------------------
 // LED helpers
@@ -44,7 +68,7 @@ static void configure_led(void) {
   led_strip_config_t strip_config = {};
   led_strip_rmt_config_t rmt_config = {};
 
-  strip_config.strip_gpio_num = PIN_NEOPIXEL;
+  strip_config.strip_gpio_num = ED_ONBOARD_LED;
   strip_config.max_leds = NUM_LEDS;
   strip_config.led_model = LED_MODEL_WS2812;
   strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
@@ -208,6 +232,7 @@ extern "C" void app_main() {
     mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
 
     ED_MQTT_dispatcher::MQTTdispatcher::initialize(&mqtt_cfg);
+    ED_MQTT_dispatcher::MQTTdispatcher::registerJsonFieldProvider(wifiDiagProvider);
     ED_MQTT_dispatcher::MQTTdispatcher::run();
 
     static ED_OTA::OTAmanager otaManager;
